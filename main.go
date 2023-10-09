@@ -83,14 +83,14 @@ func main() {
 
 	fmt.Println("PR:", pr)
 	mrInfoChan := make(chan GitLabMergeRequest)
-	go FetchPRInfo(pr, mrInfoChan)
+	go fetchPRInfo(pr, mrInfoChan)
 
 	// Meanwhile while the MR info is being fetched start preparing a clean repo
 	tempDirChan := make(chan string)
 	// From now on we make changes to the working directory that might need to be restored
 	defer func() {
 		fmt.Println("Cleanup temporary changes")
-		currentDir := GetWorkingDir()
+		currentDir := getWorkingDir()
 		tempDir := <-tempDirChan
 
 		modulesBackupDir := path.Join(tempDir, "node_modules")
@@ -108,15 +108,15 @@ func main() {
 		}
 
 	}()
-	go BackupNodeModules(tempDirChan)
+	go backupNodeModules(tempDirChan)
 
 	mrInfo := <-mrInfoChan
 	fmt.Println("Switching to branch", mrInfo.SourceBranch)
 
-	OpenShell(pr, mrInfo.Pipeline.Status)
+	openShell(pr, mrInfo.Pipeline.Status)
 }
 
-func BackupNodeModules(tempDir chan string) {
+func backupNodeModules(tempDir chan string) {
 	dir, err := os.MkdirTemp("", "gitlab-review-*")
 	if err != nil {
 		panic(fmt.Errorf("Could not create temp dir to backup node_modules: %w", err))
@@ -124,17 +124,17 @@ func BackupNodeModules(tempDir chan string) {
 
 	fmt.Println("Moving node_modules to", dir)
 
-	os.Rename(path.Join(GetWorkingDir(), "node_modules"), path.Join(dir, "node_modules"))
+	os.Rename(path.Join(getWorkingDir(), "node_modules"), path.Join(dir, "node_modules"))
 
 	tempDir <- dir
 }
 
-func GetWorkingDir() string {
+func getWorkingDir() string {
 	_, filename, _, _ := runtime.Caller(1)
 	return path.Dir(filename)
 }
 
-func CheckIfRepoIsClean() bool {
+func checkIfRepoIsClean() bool {
 	cmd := exec.Command("git", "status", "-s")
 	res, err := cmd.Output()
 	if err != nil {
@@ -144,7 +144,7 @@ func CheckIfRepoIsClean() bool {
 	return len(res) == 0
 }
 
-func FetchPRInfo(pr string, mrInfo chan GitLabMergeRequest) {
+func fetchPRInfo(pr string, mrInfo chan GitLabMergeRequest) {
 	// Build PR API call
 	instance := viper.GetString("instance")
 	projectId := viper.GetInt("project_id")
@@ -180,7 +180,7 @@ func FetchPRInfo(pr string, mrInfo chan GitLabMergeRequest) {
 
 }
 
-func OpenShell(mr string, status string) {
+func openShell(mr string, status string) {
 	cmd := exec.Command("bash")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
