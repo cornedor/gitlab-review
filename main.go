@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -76,15 +75,17 @@ func main() {
 	}
 
 	// Make sure some default folders are created
-	userCacheDir, err := os.UserCacheDir()
+	osUserCacheDir, err := os.UserCacheDir()
 	if err != nil {
 		panic(fmt.Errorf("Can't find a user cache dir, is your $HOME set?: %w", err))
 	}
 
-	err = os.MkdirAll(path.Join(userCacheDir, "gitlab-review", "yarn"), 0750)
+	err = os.MkdirAll(path.Join(osUserCacheDir, "gitlab-review", "yarn"), 0750)
 	if err != nil {
 		panic(fmt.Errorf("Can't create cache dir: %w", err))
 	}
+
+	grCacheDir := path.Join(osUserCacheDir, "gitlab-review")
 
 	//
 
@@ -92,115 +93,58 @@ func main() {
 	if len(tailArgs) == 0 {
 		panic(fmt.Errorf("No PR defined. Usage: gitlab-review [...options] [pr]"))
 	}
-	pr := pflag.Args()[0]
+	mr := pflag.Args()[0]
 
-	fmt.Println("PR:", pr)
+	// Start fetching MR info from GitLab
+	fmt.Println("Reviewing MR:", mr)
 	mrInfoChan := make(chan GitLabMergeRequest)
-	go fetchPRInfo(pr, mrInfoChan)
+	go fetchPRInfo(mr, mrInfoChan)
 
-	// Meanwhile while the MR info is being fetched start preparing a clean repo
-	ds, ib, td, cd := false, "", "", ""
-	initialBranch := &ib
-	didStash := &ds
-	tempDir := &td
-	yarnCacheDir := &cd
+	// In the meantime we can start setup the environment
+	workingDir := getWorkingDir()
+	// Create a temporary directory for storing caches
+	tempDir, err := os.MkdirTemp("", "gitlab-review-*")
+	if err != nil {
+		panic(fmt.Errorf("Could not create temp dir to backup node_modules: %w", err))
+	}
 
-	// From now on we make changes to the working directory that might need to be restored
-	defer func() {
-		fmt.Println("Cleanup temporary changes")
-		currentDir := getWorkingDir()
-
-		fmt.Println("Restoring from", *tempDir)
-
-		if len(*yarnCacheDir) > 0 {
-			err = os.Rename(path.Join(getWorkingDir(), "node_modules"), *yarnCacheDir)
-			if err != nil {
-				log.Println("Could not save to cache %w", err)
-			}
-		}
-
-		modulesBackupDir := path.Join(*tempDir, "node_modules")
-		if _, err := os.Stat(modulesBackupDir); err != nil {
-			if os.IsNotExist(err) {
-				fmt.Println("node_modules backup not found, leaving current state intact.")
-			} else {
-				fmt.Println("Unkown error while restoring node_modules, you might need to reinstall them.")
-			}
-		} else {
-			fmt.Println("Restoring node_modules from backup")
-			os.RemoveAll(path.Join(currentDir, "node_modules"))
-			os.Rename(modulesBackupDir, path.Join(currentDir, "node_modules"))
-
-		}
-
-		fmt.Println("Switching back to", string(*initialBranch))
-		// runGitCommand("switch", string(*initialBranch))
-		cmd := exec.Command("git", "switch", *initialBranch)
-		res, err := cmd.Output()
-		if err != nil {
-			fmt.Println("Could not switch back to previous branch, %w", err)
-		}
-		fmt.Println(string(res))
-
-		if *didStash {
-			runGitCommand("stash", "pop")
-		}
-
-	}()
-	*tempDir = backupNodeModules()
+	if viper.GetBool("yarn") {
+		BackupNodeModules(workingDir, tempDir)
+		defer RestoreNodeModules(workingDir, tempDir)
+	}
 
 	isRepoClean := checkIfRepoIsClean()
-	*initialBranch = strings.TrimSpace(runGitCommand("rev-parse", "--abbrev-ref", "HEAD"))
+	initialBranch := strings.TrimSpace(runGitCommand("rev-parse", "--abbrev-ref", "HEAD"))
 
 	if !isRepoClean {
 		runGitCommand("stash", "--include-untracked")
-		*didStash = true
+		defer runGitCommand("stash", "pop")
 	}
 
 	mrInfo := <-mrInfoChan
+
 	fmt.Println("Switching to branch", mrInfo.SourceBranch)
 	runGitCommand("fetch")
 	runGitCommand("switch", mrInfo.SourceBranch)
 	// Make sure the branch itself is updated
 	runGitCommand("pull")
 
+	defer func() {
+		fmt.Println("Switching back to", string(initialBranch))
+		cmd := exec.Command("git", "switch", initialBranch)
+		res, err := cmd.Output()
+		if err != nil {
+			fmt.Println("Could not switch back to previous branch, %w", err)
+		}
+		fmt.Println(string(res))
+	}()
+
 	if viper.GetBool("yarn") {
-		*yarnCacheDir = path.Join(userCacheDir, "gitlab-review", "yarn", strconv.Itoa(mrInfo.ProjectId))
-		yarnInstall(*yarnCacheDir)
+		cacheDir := YarnInstall(workingDir, grCacheDir, mrInfo.ProjectId)
+		defer RestoreYarnCache(workingDir, cacheDir)
 	}
 
-	openShell(pr, mrInfo.Pipeline.Status)
-}
-
-func yarnInstall(cacheDir string) {
-	os.MkdirAll(cacheDir, 0750)
-	// Symlink has issues in some projects
-	// err := os.Symlink(cacheDir, path.Join(getWorkingDir(), "node_modules"))
-	err := os.Rename(cacheDir, path.Join(getWorkingDir(), "node_modules"))
-	if err != nil {
-		log.Println("Could not use cache %w", err)
-	}
-
-	cmd := exec.Command("yarn", "install", "--prefer-offline")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err = cmd.Run()
-	if err != nil {
-		log.Println("Could not install yarn dependencies")
-	}
-
-}
-
-func backupNodeModules() string {
-	dir, err := os.MkdirTemp("", "gitlab-review-*")
-	if err != nil {
-		panic(fmt.Errorf("Could not create temp dir to backup node_modules: %w", err))
-	}
-
-	fmt.Println("Moving node_modules to", dir)
-	os.Rename(path.Join(getWorkingDir(), "node_modules"), path.Join(dir, "node_modules"))
-
-	return dir
+	openShell(mr, mrInfo.Pipeline.Status)
 }
 
 func getWorkingDir() string {
