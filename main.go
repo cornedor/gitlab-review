@@ -4,13 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path"
-	"runtime"
 	"strconv"
+	"strings"
 
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -28,6 +29,7 @@ type GitLabPipeline struct {
 }
 
 type GitLabMergeRequest struct {
+	ProjectId    int            `json:"project_id"`
 	Id           int            `json:"id"`
 	Title        string         `json:"title"`
 	TargetBranch string         `json:"target_branch"`
@@ -73,7 +75,18 @@ func main() {
 		}
 	}
 
-	fmt.Println("Will install using yarn?", viper.GetBool("yarn"))
+	// Make sure some default folders are created
+	userCacheDir, err := os.UserCacheDir()
+	if err != nil {
+		panic(fmt.Errorf("Can't find a user cache dir, is your $HOME set?: %w", err))
+	}
+
+	err = os.MkdirAll(path.Join(userCacheDir, "gitlab-review", "yarn"), 0750)
+	if err != nil {
+		panic(fmt.Errorf("Can't create cache dir: %w", err))
+	}
+
+	//
 
 	tailArgs := pflag.Args()
 	if len(tailArgs) == 0 {
@@ -86,14 +99,27 @@ func main() {
 	go fetchPRInfo(pr, mrInfoChan)
 
 	// Meanwhile while the MR info is being fetched start preparing a clean repo
-	tempDirChan := make(chan string)
+	ds, ib, td, cd := false, "", "", ""
+	initialBranch := &ib
+	didStash := &ds
+	tempDir := &td
+	yarnCacheDir := &cd
+
 	// From now on we make changes to the working directory that might need to be restored
 	defer func() {
 		fmt.Println("Cleanup temporary changes")
 		currentDir := getWorkingDir()
-		tempDir := <-tempDirChan
 
-		modulesBackupDir := path.Join(tempDir, "node_modules")
+		fmt.Println("Restoring from", *tempDir)
+
+		if len(*yarnCacheDir) > 0 {
+			err = os.Rename(path.Join(getWorkingDir(), "node_modules"), *yarnCacheDir)
+			if err != nil {
+				log.Println("Could not save to cache %w", err)
+			}
+		}
+
+		modulesBackupDir := path.Join(*tempDir, "node_modules")
 		if _, err := os.Stat(modulesBackupDir); err != nil {
 			if os.IsNotExist(err) {
 				fmt.Println("node_modules backup not found, leaving current state intact.")
@@ -107,39 +133,98 @@ func main() {
 
 		}
 
+		fmt.Println("Switching back to", string(*initialBranch))
+		// runGitCommand("switch", string(*initialBranch))
+		cmd := exec.Command("git", "switch", *initialBranch)
+		res, err := cmd.Output()
+		if err != nil {
+			fmt.Println("Could not switch back to previous branch, %w", err)
+		}
+		fmt.Println(string(res))
+
+		if *didStash {
+			runGitCommand("stash", "pop")
+		}
+
 	}()
-	go backupNodeModules(tempDirChan)
+	*tempDir = backupNodeModules()
+
+	isRepoClean := checkIfRepoIsClean()
+	*initialBranch = strings.TrimSpace(runGitCommand("rev-parse", "--abbrev-ref", "HEAD"))
+
+	if !isRepoClean {
+		runGitCommand("stash", "--include-untracked")
+		*didStash = true
+	}
 
 	mrInfo := <-mrInfoChan
 	fmt.Println("Switching to branch", mrInfo.SourceBranch)
+	runGitCommand("fetch")
+	runGitCommand("switch", mrInfo.SourceBranch)
+	// Make sure the branch itself is updated
+	runGitCommand("pull")
+
+	if viper.GetBool("yarn") {
+		*yarnCacheDir = path.Join(userCacheDir, "gitlab-review", "yarn", strconv.Itoa(mrInfo.ProjectId))
+		yarnInstall(*yarnCacheDir)
+	}
 
 	openShell(pr, mrInfo.Pipeline.Status)
 }
 
-func backupNodeModules(tempDir chan string) {
+func yarnInstall(cacheDir string) {
+	os.MkdirAll(cacheDir, 0750)
+	// Symlink has issues in some projects
+	// err := os.Symlink(cacheDir, path.Join(getWorkingDir(), "node_modules"))
+	err := os.Rename(cacheDir, path.Join(getWorkingDir(), "node_modules"))
+	if err != nil {
+		log.Println("Could not use cache %w", err)
+	}
+
+	cmd := exec.Command("yarn", "install", "--prefer-offline")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
+	if err != nil {
+		log.Println("Could not install yarn dependencies")
+	}
+
+}
+
+func backupNodeModules() string {
 	dir, err := os.MkdirTemp("", "gitlab-review-*")
 	if err != nil {
 		panic(fmt.Errorf("Could not create temp dir to backup node_modules: %w", err))
 	}
 
 	fmt.Println("Moving node_modules to", dir)
-
 	os.Rename(path.Join(getWorkingDir(), "node_modules"), path.Join(dir, "node_modules"))
 
-	tempDir <- dir
+	return dir
 }
 
 func getWorkingDir() string {
-	_, filename, _, _ := runtime.Caller(1)
-	return path.Dir(filename)
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Errorf("Could not get current working directory: %w", err))
+	}
+
+	return dir
+}
+
+func runGitCommand(arg ...string) string {
+	cmd := exec.Command("git", arg...)
+	res, err := cmd.Output()
+	if err != nil {
+		fmt.Println(string(res))
+		panic(fmt.Errorf("Failed running git %s: %w", arg[0], err))
+	}
+
+	return string(res)
 }
 
 func checkIfRepoIsClean() bool {
-	cmd := exec.Command("git", "status", "-s")
-	res, err := cmd.Output()
-	if err != nil {
-		panic(fmt.Errorf("Failed running git status: %w", err))
-	}
+	res := runGitCommand("status", "-s")
 
 	return len(res) == 0
 }
@@ -186,7 +271,11 @@ func openShell(mr string, status string) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
-	ps1 := fmt.Sprintf(`PS1=\[\e[97;101;1;5m\] <Reviewing MR-%s> \[\e[0;30;103m\] Pipeline %s \[\e[0m\] \w %% `, mr, status)
+	color := 103 // yellow
+	if status == "success" {
+		color = 102 // green
+	}
+	ps1 := fmt.Sprintf(`PS1=\[\e[97;101;1m\] <Reviewing MR-%s> \[\e[0;30;%dm\] Pipeline %s \[\e[0m\] \w %% `, mr, color, status)
 	cmd.Env = append(cmd.Env, ps1)
 	_ = cmd.Run()
 }
