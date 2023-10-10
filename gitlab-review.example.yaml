@@ -1,0 +1,12 @@
+# The settings in this example file can also be stored in ~/.config/gitlab-review/config.yaml
+# Aside from YAML you can also use JSON, TOML, HCL, envfile and Java properties config files
+
+# GitLab instance settings
+instance: "https://gitlab.example.org/"
+token: gplat-xxxxxxxxxxxxxxxx
+
+
+# Project specific settings
+project_id: 151
+yarn: true
+composer: true
