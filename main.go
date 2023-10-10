@@ -58,7 +58,9 @@ func main() {
 	viper.AddConfigPath("../..")
 	viper.AddConfigPath("../../..")
 
-	pflag.Bool("yarn", false, "Install packages using yarn")
+	pflag.BoolP("yarn", "r", false, "Install packages using yarn")
+	pflag.BoolP("composer", "c", false, "Install packages using composer")
+	pflag.BoolP("ddev-composer", "e", false, "Install packages using composer in DDEV container")
 	pflag.Parse()
 
 	viper.BindPFlags(pflag.CommandLine)
@@ -113,6 +115,12 @@ func main() {
 		defer RestoreNodeModules(workingDir, tempDir)
 	}
 
+	isComposer := viper.GetBool("composer") || viper.GetBool("ddev-composer")
+	if isComposer {
+		BackupVendor(workingDir, tempDir)
+		defer RestoreVendor(workingDir, tempDir)
+	}
+
 	isRepoClean := checkIfRepoIsClean()
 	initialBranch := strings.TrimSpace(runGitCommand("rev-parse", "--abbrev-ref", "HEAD"))
 
@@ -142,6 +150,12 @@ func main() {
 	if viper.GetBool("yarn") {
 		cacheDir := YarnInstall(workingDir, grCacheDir, mrInfo.ProjectId)
 		defer RestoreYarnCache(workingDir, cacheDir)
+	}
+
+	if isComposer {
+		isDdev := viper.GetBool("ddev-composer")
+		cacheDir := ComposerInstall(workingDir, grCacheDir, mrInfo.ProjectId, isDdev)
+		defer RestoreVendor(workingDir, cacheDir)
 	}
 
 	openShell(mr, mrInfo.Pipeline.Status)

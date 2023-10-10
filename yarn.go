@@ -54,6 +54,6 @@ func RestoreYarnCache(workingDir string, cacheDir string) {
 	err := os.Rename(path.Join(workingDir, "node_modules"), cacheDir)
 
 	if err != nil {
-		log.Println("Could not save to cache %w", err)
+		log.Println("Could not save node_modules to cache %w", err)
 	}
 }
